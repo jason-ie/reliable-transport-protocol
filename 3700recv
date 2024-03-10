@@ -1,0 +1,105 @@
+#!/usr/bin/env node
+
+const dgram = require("dgram");
+const process = require("process");
+
+class Receiver {
+  constructor() {
+    this.socket = dgram.createSocket("udp4");
+    this.socket.bind(0, "0.0.0.0");
+
+    this.socket.on("listening", () => {
+      const address = this.socket.address();
+      this.port = address.port;
+      this.log(`Bound to port ${this.port}`);
+    });
+
+    this.remoteHost = null;
+    this.remotePort = null;
+
+    this.socket.on("message", (msg, rinfo) => {
+      if (this.remoteHost === null) {
+        this.remoteHost = rinfo.address;
+        this.remotePort = rinfo.port;
+      }
+
+      const message = JSON.parse(msg.toString());
+      this.log(`Received message ${JSON.stringify(message)}`);
+
+      if (message.type === "data") {
+        // Print out the data to stdout
+        process.stdout.write(message.data, "utf8");
+
+        // Always send back an ack with the sequence number of the received packet
+        this.send({ type: "ack", sequenceNum: message.sequenceNum });
+      } else if (message.type === "ack") {
+        // Handle ack message appropriately without writing to stdout
+        // This would involve updating any required internal state, such as sequence numbers and window size
+        this.log(`Received ack for sequence number ${message.sequenceNum}`);
+      }
+    });
+  }
+
+  send(message) {
+    const messageBuffer = Buffer.from(JSON.stringify(message), "utf-8");
+    this.socket.send(
+      messageBuffer,
+      0,
+      messageBuffer.length,
+      this.remotePort,
+      this.remoteHost,
+      (err) => {
+        if (err) this.log(`Send error: ${err}`);
+        else this.log(`Sent ack: ${JSON.stringify(message)}`);
+      }
+    );
+  }
+
+  log(message) {
+    process.stderr.write(message + "\n");
+  }
+
+  run() {
+    this.socket.on("listening", () => {
+      const address = this.socket.address();
+      this.port = address.port;
+      this.log(`Bound to port ${this.port}`);
+    });
+
+    this.socket.on("message", (msgBuffer, rinfo) => {
+      if (this.remoteHost === null) {
+        this.remoteHost = rinfo.address;
+        this.remotePort = rinfo.port;
+      }
+
+      // Parse the incoming message
+      const msg = JSON.parse(msgBuffer.toString());
+      this.log(`Received packet: ${JSON.stringify(msg)}`);
+
+      if (msg.type === "data") {
+        // Check if the message has the sequence number we're expecting
+        if (msg.sequenceNum === this.expectedSeqNum) {
+          // Process the data message
+
+          // Print out the data to stdout if the packet is in order
+          process.stdout.write(msg.data, "utf8");
+
+          // Prepare to expect the next packet by toggling the expected sequence number
+          this.expectedSeqNum = 1 - this.expectedSeqNum;
+        } else {
+          // If out of order, you can choose to log this event or handle it as needed
+          this.log(
+            `Received out-of-order packet. Expected: ${this.expectedSeqNum}, Received: ${msg.sequenceNum}`
+          );
+        }
+
+        // Always send back an ack with the sequence number of the received packet
+        this.send({ type: "ack", sequenceNum: msg.sequenceNum });
+      }
+    });
+  }
+}
+
+// No command line arguments are parsed in this basic version, but you could use a library like `yargs` for more complex needs
+const receiver = new Receiver();
+receiver.run();

@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+
+const dgram = require("dgram");
+const readline = require("readline");
+const process = require("process");
+
+const DATA_SIZE = 1375;
+
+class Sender {
+  constructor(host, port) {
+    this.host = host;
+    this.remotePort = parseInt(port, 10);
+    this.socket = dgram.createSocket("udp4");
+    this.sequenceNum = 0; // Start with sequence number 0
+    this.awaitingAck = false;
+
+    this.rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    // Inside the receiver's message event handler
+    this.socket.on("message", (msg, rinfo) => {
+      const message = JSON.parse(msg.toString());
+      this.log(`Received ack: ${JSON.stringify(message)}`);
+
+      if (message.type === "ack" && message.sequenceNum === this.sequenceNum) {
+        // The packet has been acknowledged, you can send the next one
+        this.awaitingAck = false;
+        this.sequenceNum = 1 - this.sequenceNum; // Toggle sequence number for the next packet
+        this.sendNext(); // Attempt to send the next packet
+      }
+    });
+
+    this.toSendQueue = []; // Queue to manage data waiting to be sent
+    this.allDataRead = false; // Flag to indicate EOF has been reached
+  }
+
+  log(message) {
+    process.stderr.write(`${message}\n`);
+  }
+
+  queueData(data) {
+    if (data) this.toSendQueue.push(data);
+    this.sendNext();
+  }
+
+  sendNext() {
+    if (!this.awaitingAck && this.toSendQueue.length > 0) {
+      const data = this.toSendQueue.shift();
+      const packet = { type: "msg", data, sequenceNum: this.sequenceNum };
+      const packetBuffer = Buffer.from(JSON.stringify(packet));
+      this.socket.send(
+        packetBuffer,
+        0,
+        packetBuffer.length,
+        this.remotePort,
+        this.host,
+        (err) => {
+          if (err) {
+            this.log(`Send error: ${err}`);
+          } else {
+            this.log(`Packet sent with sequence number: ${this.sequenceNum}`);
+            this.awaitingAck = true;
+          }
+        }
+      );
+    }
+  }
+
+  run() {
+    this.rl.on("line", (input) => {
+      if (input.length === 0) {
+        this.allDataRead = true;
+        this.sendNext(); // Ensure we try to send remaining data
+      } else {
+        this.queueData(input.substring(0, DATA_SIZE));
+      }
+    });
+  }
+}
+
+const args = process.argv.slice(2);
+if (args.length !== 2) {
+  console.error("Usage: 3700send <host> <port>");
+  process.exit(1);
+}
+
+const sender = new Sender(args[0], parseInt(args[1], 10));
+sender.run();
