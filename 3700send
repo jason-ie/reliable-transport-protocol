@@ -1,90 +1,84 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S python3 -u
 
-const dgram = require("dgram");
-const readline = require("readline");
-const process = require("process");
+import argparse, socket, time, json, sys
 
-const DATA_SIZE = 1375;
+DATA_SIZE = 1375
+BASE_RTT = 1.0  # Base RTT estimate
+MAX_RTT = 5.0  # Reasonable maximum RTT to avoid indefinite waiting but still attempt retransmission
 
-class Sender {
-  constructor(host, port) {
-    this.host = host;
-    this.remotePort = parseInt(port, 10);
-    this.socket = dgram.createSocket("udp4");
-    this.sequenceNum = 0; // Start with sequence number 0
-    this.awaitingAck = false;
+class Sender:
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.socket.settimeout(0.5)  # Short timeout for ACK checks
+        self.seq_num = 0
+        self.window = []  # Format: [(seq_num, data, send_time, ack_received, resend_attempts), ...]
 
-    this.rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
 
-    // Inside the receiver's message event handler
-    this.socket.on("message", (msg, rinfo) => {
-      const message = JSON.parse(msg.toString());
-      this.log(`Received ack: ${JSON.stringify(message)}`);
+    def send_packet(self, packet, initial_send=True, index=None):
+        self.socket.sendto(json.dumps(packet).encode('utf-8'), (self.host, self.remote_port))
+        if initial_send:
+            self.window.append((packet['seq'], packet['data'], time.time(), False, 0))
+        else:
+            attempts = self.window[index][4] + 1
+            self.window[index] = (packet['seq'], packet['data'], time.time(), False, attempts)
 
-      if (message.type === "ack" && message.sequenceNum === this.sequenceNum) {
-        // The packet has been acknowledged, you can send the next one
-        this.awaitingAck = false;
-        this.sequenceNum = 1 - this.sequenceNum; // Toggle sequence number for the next packet
-        this.sendNext(); // Attempt to send the next packet
-      }
-    });
+    def resend_packets(self):
+        current_time = time.time()
+        for index, (seq, data, send_time, ack_received, attempts) in enumerate(self.window):
+            rtt_adjustment = BASE_RTT + (0.5 * attempts)
+            rtt = min(rtt_adjustment, MAX_RTT)  # Adjust for the increasing RTT up to a max
+            if not ack_received and current_time - send_time > rtt:
+                self.log(f"Resending message with seq {seq} due to timeout, attempt {attempts + 1}")
+                self.send_packet({"type": "msg", "seq": seq, "data": data}, initial_send=False, index=index)
 
-    this.toSendQueue = []; // Queue to manage data waiting to be sent
-    this.allDataRead = false; // Flag to indicate EOF has been reached
-  }
+    def receive_ack(self):
+        while True:
+            try:
+                data, _ = self.socket.recvfrom(1024)
+                ack = json.loads(data.decode('utf-8'))
+                if ack["type"] == "ack":
+                    for index, (seq, data, send_time, ack_received, attempts) in enumerate(self.window):
+                        if seq == ack["seq"]:
+                            self.window[index] = (seq, data, send_time, True, attempts)
+                            self.log(f"Received ACK for seq {seq}")
+                            break
+                    # Cleanly remove acknowledged packets
+                    self.window = [pkt for pkt in self.window if not pkt[3]]
+                    break
+            except socket.timeout:
+                self.resend_packets()
+                break
 
-  log(message) {
-    process.stderr.write(`${message}\n`);
-  }
+    def run(self):
+        while True:
+            data = sys.stdin.read(DATA_SIZE)
+            if not data:
+                self.log("All data read. Waiting for remaining ACKs.")
+                break
 
-  queueData(data) {
-    if (data) this.toSendQueue.push(data);
-    this.sendNext();
-  }
+            packet = {"type": "msg", "seq": self.seq_num, "data": data}
+            self.send_packet(packet)
+            self.seq_num += 1
 
-  sendNext() {
-    if (!this.awaitingAck && this.toSendQueue.length > 0) {
-      const data = this.toSendQueue.shift();
-      const packet = { type: "msg", data, sequenceNum: this.sequenceNum };
-      const packetBuffer = Buffer.from(JSON.stringify(packet));
-      this.socket.send(
-        packetBuffer,
-        0,
-        packetBuffer.length,
-        this.remotePort,
-        this.host,
-        (err) => {
-          if (err) {
-            this.log(`Send error: ${err}`);
-          } else {
-            this.log(`Packet sent with sequence number: ${this.sequenceNum}`);
-            this.awaitingAck = true;
-          }
-        }
-      );
-    }
-  }
+            if len(self.window) >= 4:
+                self.receive_ack()
 
-  run() {
-    this.rl.on("line", (input) => {
-      if (input.length === 0) {
-        this.allDataRead = true;
-        this.sendNext(); // Ensure we try to send remaining data
-      } else {
-        this.queueData(input.substring(0, DATA_SIZE));
-      }
-    });
-  }
-}
+        while self.window:
+            self.receive_ack()
 
-const args = process.argv.slice(2);
-if (args.length !== 2) {
-  console.error("Usage: 3700send <host> <port>");
-  process.exit(1);
-}
+        self.log("Transmission complete.")
+        sys.exit(0)
 
-const sender = new Sender(args[0], parseInt(args[1], 10));
-sender.run();
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
