@@ -1,84 +1,227 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, sys
+import argparse
+import socket
+import time
+import json
+import sys
+import select
 
-DATA_SIZE = 1375
-BASE_RTT = 1.0  # Base RTT estimate
-MAX_RTT = 5.0  # Reasonable maximum RTT to avoid indefinite waiting but still attempt retransmission
+DATA_SIZE = 1375 # 1500 - 20 (IP header) - 8 (UDP header) - 12 (JSON overhead)
+RTT = 1.0 # 1 second round trip time
 
 class Sender:
     def __init__(self, host, port):
+        # Starter code
         self.host = host
         self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('0.0.0.0', 0))
-        self.socket.settimeout(0.5)  # Short timeout for ACK checks
-        self.seq_num = 0
-        self.window = []  # Format: [(seq_num, data, send_time, ack_received, resend_attempts), ...]
+        self.waiting = False
+        
+        self.seq_num = 0 # Sequence number for the next packet
+        self.window = {} # Window of unacknowledged packets
+        self.ack_received = set([]) # Set of received ACKs
+        self.congestion_window = 64 # Congestion window size
+        self.window_size = 1 # Current window size
+        self.next_ack = 0 # Next expected ACK
+        self.out_of_order = 0 # Number of out of order ACKs
+        self.a = 0.875 # ALPHA value for congestion control
 
     def log(self, message):
-        sys.stderr.write(message + "\n")
+        # Starter code
+        sys.stderr.write(f"{message}\n")
         sys.stderr.flush()
+        
+        
+    def send(self, message):
+        # Starter code
+        message['c'] = self.checksum(message)
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+        
+    def checksum(self, message):
+        """
+        Calculate the checksum of a message.
+        The checksum is the sum of the ASCII values of the characters in the JSON representation of the message, modulo 256.
+        """
+        return sum(json.dumps(message).encode('utf-8')) % 256
 
-    def send_packet(self, packet, initial_send=True, index=None):
-        self.socket.sendto(json.dumps(packet).encode('utf-8'), (self.host, self.remote_port))
-        if initial_send:
-            self.window.append((packet['seq'], packet['data'], time.time(), False, 0))
+    def send_packet(self):
+        """
+        Send a packet of data read from stdin.
+        If the window is full or stdin is empty, set the waiting flag to True.
+        """
+        while not self.waiting:
+            data = sys.stdin.read(DATA_SIZE)
+            if len(data) == 0:
+                self.log("Transmission complete.")
+                if self.ack_received or self.window:
+                    self.waiting = True
+                    self.log("Waiting for ACKs")
+                else:
+                    sys.exit(0)
+            else:
+                msg = {"type": "msg", "data": data}
+                self.log(f"Sending message with seq {self.seq_num} to " % msg)
+                self.window[self.seq_num] = {"data": msg['data'], "send_time": time.time()}
+                msg['seq'] = self.seq_num
+                if self.ack_received and self.out_of_order == 3:
+                    msg['next'] = self.next_ack
+                    self.adjust_window("3 out of order")
+                self.send(msg)
+                self.seq_num += 1
+                if len(self.window) >= self.window_size:
+                    self.waiting = True
+                    self.log("Window full, waiting for ACKs")
+
+    def receive_packet(self, conn):
+        """
+        Receive a packet of data from the socket.
+        If the checksum of the received packet does not match the calculated checksum, ignore the packet.
+        If the packet is an acknowledgement, process the acknowledgement.
+        """
+        data, addr = conn.recvfrom(65535)
+        msg = json.loads(data.decode('utf-8'))
+        self.log(f"Received message with seq {msg['seq']}")
+        
+        checksum = msg.pop('c', -1)
+        if (checksum == -1 or checksum != self.checksum(msg)):
+            self.log(f"Checksum failed for seq {msg['seq']}")
+            return
+        
+        if msg["type"] == "ack":
+            self.log(f"Received ACK for seq {msg['seq']}")
+            self.process_acks(msg)
         else:
-            attempts = self.window[index][4] + 1
-            self.window[index] = (packet['seq'], packet['data'], time.time(), False, attempts)
+            self.log("Ignoring message of unknown type")
+            return
 
+
+    def process_acks(self, msg):
+        """
+        Process an acknowledgement message.
+        If the acknowledgement is for a packet that has already been acknowledged, ignore the packet.
+        If the acknowledgement is for a packet that is in the window, remove the packet from the window and adjust the window size.
+        If the acknowledgement is for a packet that is out of order, add the packet to the set of out of order acknowledgements.
+        """
+        ack_num = msg["seq"]
+        self.adjust_window("acknowledged")
+        if ack_num < self.next_ack or ack_num in self.ack_received:
+            self.log(f"Received duplicate ACK for seq {ack_num}")
+            return
+        else:
+            self.window.pop(ack_num)
+            if ack_num == self.next_ack:
+                self.next_ack += 1
+                self.out_of_order = 0
+                if self.ack_received:
+                    while self.ack_received and min(self.ack_received) == self.next_ack:
+                        self.ack_received.remove(self.next_ack)
+                        self.next_ack += 1
+                self.log(f"Next expected ACK is {self.next_ack}")
+            elif ack_num > self.next_ack:
+                self.ack_received.add(ack_num)
+                if 'next' in msg:
+                    self.log(f"Next expected ACK is {msg['next']}")
+                    if msg["next"] == self.next_ack:
+                        self.window.pop(msg['next'])
+                        self.next_ack += 1
+                        self.out_of_order = 0
+                        if self.ack_received:
+                            while self.ack_received and min(self.ack_received) == self.next_ack:
+                                self.ack_received.remove(self.next_ack)
+                                self.next_ack += 1
+                    elif msg["next"] == self.next_ack * -1:
+                        self.log(f"Resending message with seq {msg['next']} due to timeout")
+                        self.send({"type": "msg", "data": self.window[self.next_ack]['data'], "seq": self.next_ack})
+                        self.window[msg['next']]['send_time'] = time.time()
+                        self.out_of_order = 0
+                self.out_of_order += 1
+                self.log(f"Out of order ACK for seq {ack_num}")
+                
+    def adjust_window(self, event):
+        """
+        Adjust the window size based on the event that occurred.
+
+        Parameters:
+        event (str): The event that occurred. Can be "acknowledged", "timeout", or "3 out of order".
+
+        If the event is "acknowledged", the window size is doubled if it is less than the congestion window size, 
+        otherwise it is incremented by 1.
+
+        If the event is "timeout", the congestion window size is set to the maximum of 1 and the congestion window size 
+        multiplied by the weighting factor for the exponential weighted moving average (EWMA). The window size is set to 1.
+
+        If the event is "3 out of order", the congestion window size is set to the maximum of 1 and the congestion window size 
+        multiplied by the weighting factor for the exponential weighted moving average (EWMA). The window size is set to the 
+        congestion window size plus 3.
+
+        If the window size is less than or equal to the number of packets in the window, the waiting flag is set to True, 
+        otherwise it is set to False.
+
+        A log message is printed to indicate that the window size has been adjusted due to the event.
+        """
+        if event == "acknowledged":
+            if self.window_size < self.congestion_window:
+                self.window_size *= 2
+            else:
+                self.window_size += 1
+        elif event == "timeout":
+            self.congestion_window = max(1, self.congestion_window * self.a)
+            self.window_size = 1
+        elif event == "3 out of order":
+            self.congestion_window = max(1, self.congestion_window * self.a)
+            self.window_size = self.congestion_window + 3
+        
+        if self.window_size <= len(self.window):
+            self.waiting = True
+        else:
+            self.waiting = False
+        self.log(f"Window size adjusted to {self.window_size} due to {event}")
+        
     def resend_packets(self):
+        """
+        Resend packets that have not been acknowledged within 1.5 times the round trip time (RTT).
+        The current time is obtained and for each packet in the window, if the current time minus the send time of the packet 
+        is greater than 1.5 times the RTT, the packet is resent and the send time is updated to the current time. 
+        The window size is then adjusted due to the timeout.
+        """
         current_time = time.time()
-        for index, (seq, data, send_time, ack_received, attempts) in enumerate(self.window):
-            rtt_adjustment = BASE_RTT + (0.5 * attempts)
-            rtt = min(rtt_adjustment, MAX_RTT)  # Adjust for the increasing RTT up to a max
-            if not ack_received and current_time - send_time > rtt:
-                self.log(f"Resending message with seq {seq} due to timeout, attempt {attempts + 1}")
-                self.send_packet({"type": "msg", "seq": seq, "data": data}, initial_send=False, index=index)
-
-    def receive_ack(self):
-        while True:
-            try:
-                data, _ = self.socket.recvfrom(1024)
-                ack = json.loads(data.decode('utf-8'))
-                if ack["type"] == "ack":
-                    for index, (seq, data, send_time, ack_received, attempts) in enumerate(self.window):
-                        if seq == ack["seq"]:
-                            self.window[index] = (seq, data, send_time, True, attempts)
-                            self.log(f"Received ACK for seq {seq}")
-                            break
-                    # Cleanly remove acknowledged packets
-                    self.window = [pkt for pkt in self.window if not pkt[3]]
-                    break
-            except socket.timeout:
-                self.resend_packets()
+        for seq, data in list(self.window.items()):
+            if current_time - data['send_time'] > 1.5 * RTT:
+                self.log(f"Resending message with seq {seq} due to timeout")
+                self.send({"type": "msg", "seq": seq, "data": data['data']})
+                self.window[seq]['send_time'] = current_time
+                self.adjust_window("timeout")
                 break
 
     def run(self):
+        """
+        The main loop of the sender.
+        The sender continuously checks for incoming packets and sends packets from stdin.
+        If the sender is waiting for an acknowledgement, it only checks for incoming packets.
+        If the next acknowledgement is in the window, it resends packets that have not been acknowledged within 1.5 times the RTT.
+        """
         while True:
-            data = sys.stdin.read(DATA_SIZE)
-            if not data:
-                self.log("All data read. Waiting for remaining ACKs.")
-                break
-
-            packet = {"type": "msg", "seq": self.seq_num, "data": data}
-            self.send_packet(packet)
-            self.seq_num += 1
-
-            if len(self.window) >= 4:
-                self.receive_ack()
-
-        while self.window:
-            self.receive_ack()
-
-        self.log("Transmission complete.")
-        sys.exit(0)
+            preselect = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+            
+            sockets = select.select(preselect, [], [], 0.1)[0]
+            
+            for connection in sockets:
+                if connection == self.socket:
+                    self.receive_packet(connection)
+                elif connection == sys.stdin:
+                    self.send_packet()
+                    
+            if self.next_ack in self.window:
+                self.resend_packets()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='send data')
-    parser.add_argument('host', type=str, help="Remote host to connect to")
-    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    parser = argparse.ArgumentParser(description='3700send script for reliable UDP transmission')
+    parser.add_argument('host', type=str, help="Destination host")
+    parser.add_argument('port', type=int, help="Destination port")
     args = parser.parse_args()
+
     sender = Sender(args.host, args.port)
     sender.run()

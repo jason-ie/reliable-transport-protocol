@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, json, sys
+import argparse, socket, json, sys, select
 
 class Receiver:
     def __init__(self):
@@ -10,47 +10,79 @@ class Receiver:
         self.log("Bound to port %d" % self.port)
         self.remote_host = None
         self.remote_port = None
-        self.last_seq_num = -1
+        self.seq_num = 0
         self.buffered_packets = {}  # Buffer for out-of-order packets
 
-    def send_ack(self, seq):
-        ack_msg = {"type": "ack", "seq": seq}
-        self.socket.sendto(json.dumps(ack_msg).encode('utf-8'), (self.remote_host, self.remote_port))
+    def checksum(self, message):
+        """
+        Calculate the checksum of a message.
+        The checksum is the sum of the ASCII values of the characters in the JSON representation of the message, modulo 256.
+        """
+        return sum(json.dumps(message).encode('utf-8')) % 256
+
+    def send(self, message):
+        # Starter code
+        message['c'] = self.checksum(message)
+        self.log("Sending message: %s" % json.dumps(message))
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
 
     def log(self, message):
+        # Starter code
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
-    def process_packet(self, msg):
-        # Process in-order packet
-        self.last_seq_num = msg["seq"]
-        self.log(f"Received data message with seq {msg['seq']}")
-        print(msg["data"], end='', flush=True)
-        # Send ACK for the highest in-order packet
-        self.send_ack(self.last_seq_num)
-
     def process_buffered_packets(self):
-        # Process any buffered packets that can now be processed in sequence
-        while self.last_seq_num + 1 in self.buffered_packets:
-            next_seq = self.last_seq_num + 1
-            self.process_packet({"seq": next_seq, "data": self.buffered_packets.pop(next_seq)})
+        """
+        Process any buffered packets that can now be processed in sequence.
+        If the sequence number of a packet is in the buffered packets, the packet is printed to stdout and removed from the 
+        buffered packets. The sequence number is then incremented.
+        """ 
+        while self.seq_num in self.buffered_packets:
+            print(self.buffered_packets.pop(self.seq_num), end="", flush=True)
+            self.seq_num += 1
 
-    def run(self):
+    def run(self): 
+        """
+        The main loop of the receiver.
+        The receiver continuously checks for incoming packets.
+        If a packet is received, the checksum of the packet is checked. If the checksum does not match the calculated checksum, 
+        the packet is ignored and the next packet is processed.
+        If the checksum matches, the packet is added to the buffered packets.
+        An acknowledgement is then sent for the packet. If the packet contains a 'num' field, this is included in the 
+        acknowledgement. If the 'num' field is less than the sequence number, it is included as is, otherwise it is negated.
+        Any buffered packets that can now be processed in sequence are then processed.
+        """
         while True:
-            data, addr = self.socket.recvfrom(65535)
-            if self.remote_host is None:
-                self.remote_host = addr[0]
-                self.remote_port = addr[1]
+            sockets = select.select([self.socket], [], [])[0]
+            for connection in sockets:
+                data, addr = connection.recvfrom(65535)
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
 
-            msg = json.loads(data.decode('utf-8'))
-            if msg["seq"] > self.last_seq_num + 1:
-                # Buffer out-of-order packet
+                msg = json.loads(data.decode('utf-8'))
+                self.log(f"Received message with seq {msg['seq']}")
+                
+                checksum = msg.pop('c', -1)
+                
+                if (checksum == -1 or checksum != self.checksum(msg)):
+                    self.log(f"Checksum failed for seq {msg['seq']}")
+                    continue
+            
                 self.buffered_packets[msg["seq"]] = msg["data"]
-                self.log(f"Buffering out-of-order packet with seq {msg['seq']}")
-            elif msg["seq"] == self.last_seq_num + 1:
-                # Process in-order packet and then check for buffered packets
-                self.process_packet(msg)
-            self.process_buffered_packets()
+                
+                ack = {"type": "ack", "seq": msg["seq"]}
+                
+                if 'num' in msg:
+                    if msg['num'] < self.seq_num:
+                        ack['num'] = msg['num']
+                    else:
+                        ack["num"] = msg["num"] * -1
+                        
+                self.send(ack)
+                        
+                self.process_buffered_packets()
+
 
 if __name__ == "__main__":
     receiver = Receiver()
